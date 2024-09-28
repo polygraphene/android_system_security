@@ -61,6 +61,8 @@ pub fn get_attest_key_info(
     let challenge_present = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
     let is_device_unique_attestation =
         params.iter().any(|kp| kp.tag == Tag::DEVICE_UNIQUE_ATTESTATION);
+    log::info!("get_attest_key_info called. caller_uid={caller_uid} challenge_present={challenge_present} \
+        is_device_unique_attestation={is_device_unique_attestation} has_attest_key:{}", attest_key_descriptor.is_some());
     match attest_key_descriptor {
         // Do not select an RKP key if DEVICE_UNIQUE_ATTESTATION is present.
         None if challenge_present && !is_device_unique_attestation => rem_prov_state
