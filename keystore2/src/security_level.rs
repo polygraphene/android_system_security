@@ -69,8 +69,7 @@ use rkpd_client::store_rkpd_attestation_key;
 use std::convert::TryInto;
 use std::time::SystemTime;
 
-use bssl_sys::*;
-use std::ptr;
+use crate::cert_gen::gen_new_cert;
 
 /// Implementation of the IKeystoreSecurityLevel Interface.
 pub struct KeystoreSecurityLevel {
@@ -529,66 +528,17 @@ impl KeystoreSecurityLevel {
         let result = self.keymint.generateKey(params, attestation_key);
         let is_attestation = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
         if is_attestation && result.is_err() && attestation_key.is_none() {
-            let mut new_cert_buf = vec![];
-
-            unsafe {
-                let mut ccf_ptr = CERTIFICATE_1.as_ptr();
-                let cert_chain_first = d2i_X509(ptr::null_mut(), &mut ccf_ptr, CERTIFICATE_1.len() as i64);
-                if cert_chain_first.is_null() {
+            let (new_cert_buf, key_chara) = match gen_new_cert(params) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("keystore2hook Error on gen_new_cert: {}", e);
                     return result;
                 }
-
-                let cert = X509_new();
-                if cert.is_null() {
-                    X509_free(cert_chain_first);
-                    return result;
-                }
-                let ccf_subject = X509_get_subject_name(cert_chain_first);
-                if ccf_subject.is_null() {
-                    X509_free(cert);
-                    X509_free(cert_chain_first);
-                    return result;
-                }
-                X509_free(cert_chain_first);
-
-                X509_set_issuer_name(cert, ccf_subject);
-                let subject = X509_NAME_new();
-                if subject.is_null() {
-                    X509_free(cert);
-                    X509_free(cert_chain_first);
-                    return result;
-                }
-                X509_NAME_add_entry_by_txt(subject, "commonName".as_ptr(), MBSTRING_ASC, "Android Keystore Key".as_ptr(), -1, 0, -1);
-                X509_set_subject_name(cert, subject);
-
-                let mut der_len = i2d_X509(cert, ptr::null_mut());
-                if der_len < 1 {
-                    X509_free(cert);
-                    return result;
-                }
-
-                new_cert_buf.clear();
-                new_cert_buf.reserve(der_len as usize);
-                der_len = i2d_X509(cert, &mut new_cert_buf.as_mut_ptr());
-                new_cert_buf.set_len(der_len as usize);
-
-                let mut hex_buf = String::new();
-                for (i, b) in new_cert_buf.iter().enumerate() {
-                    hex_buf += format!("{:02x}", b).as_str();
-
-                    if i % 32 == 31 {
-                        hex_buf += "\n";
-                    }
-                }
-                log::info!("keystore2hook new cert: \n{hex_buf}");
-
-                X509_NAME_free(subject);
-                X509_free(cert);
             };
 
             let new_result = KeyCreationResult {
                 keyBlob: vec![1,2,3],
-                keyCharacteristics: vec![],
+                keyCharacteristics: key_chara,
                 certificateChain: vec![
                     Certificate { encodedCertificate: new_cert_buf },
                     Certificate { encodedCertificate: CERTIFICATE_1.to_vec() },
@@ -1162,12 +1112,17 @@ mod tests {
     use crate::error::map_km_error;
     use crate::globals::get_keymint_device;
     use crate::utils::upgrade_keyblob_if_required_with;
-    use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
+#[allow(unused_imports)]
+    use android_hardware_security_keymint::{aidl::android::hardware::security::keymint::{
         Algorithm::Algorithm, AttestationKey::AttestationKey, KeyParameter::KeyParameter,
         KeyParameterValue::KeyParameterValue, Tag::Tag,
-    };
+    }, mangled::{_7_android_8_hardware_8_security_7_keymint_10_KeyPurpose, _7_android_8_hardware_8_security_7_keymint_6_Digest}};
     use keystore2_crypto::parse_subject_from_certificate;
     use rkpd_client::get_rkpd_attestation_key;
+#[allow(unused_imports)]
+    use crate::key_parameter::{
+        KeyPurpose, EcCurve, Digest
+    };
 
     #[test]
     // This is a helper for a manual test. We want to check that after a system upgrade RKPD
@@ -1235,456 +1190,53 @@ mod tests {
         }
     }
 
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn get_bssl_error() -> String {
-        unsafe {
-            let e = ERR_get_error();
-            let mut errbuf = vec![0; 1000];
-            // requires 256 bytes
-            ERR_error_string_n(e, errbuf.as_mut_ptr(), 1000);
-            let len = errbuf.iter().position(|&e| e == 0).unwrap_or(0);
-            errbuf.set_len(len);
-            return String::from_utf8_lossy(&errbuf[0..len]).to_string();
-        }
-    }
-
-    fn get_bit_length(v: i32) -> usize {
-        if v == 0 {
-            0
-        } else {
-            32 - v.leading_zeros() as usize
-        }
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn wrap_tag_raw(buf: &mut Vec<u8>, cl: i32, constructed: i32, tag: i32, val: &[u8]) -> Result<(), String> {
-        if tag >= 31 {
-            // class, constructed: 1, long form
-            buf.push(((cl << 6) | (constructed << 5) | 0x1f) as u8);
-
-            if get_bit_length(tag) >= 8 {
-                // We only need to support 719 at the maximum.
-                buf.push((0x80 | (tag >> 7)) as u8);
-                buf.push((tag & 0x7f)  as u8);
-            } else {
-                buf.push((tag & 0x7f)  as u8);
-            }
-        } else {
-            buf.push(((cl << 6) | (constructed << 5) | tag) as u8);
-        }
-        length_octet(buf, val.len())?;
-        buf.extend(val);
-        Ok(())
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn wrap_tag(buf: &mut Vec<u8>, tag: i32, val: &[u8]) -> Result<(), String> {
-        wrap_tag_raw(buf, 2, 1, tag, val)
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn wrap_set(buf: &mut Vec<u8>, val: &[u8]) -> Result<(), String> {
-        wrap_tag_raw(buf, 0, 1, 17, val)
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn wrap_sequence(buf: &mut Vec<u8>, val: &[u8]) -> Result<(), String> {
-        wrap_tag_raw(buf, 0, 1, 16, val)
-    }
-
-    fn length_octet(buf: &mut Vec<u8>, len: usize) -> Result<(), String> {
-        if len <= 127 {
-            // short form
-            buf.push(len as u8);
-            return Ok(());
-        }
-        let len_use_octet = (get_bit_length(len as i32) + 7) / 8;
-
-        buf.push(0x80 | len_use_octet as u8);
-        for i in (0..len_use_octet).rev() {
-            buf.push(((len >> (i*8-8)) & 0xff) as u8);
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn push_int(buf: &mut Vec<u8>, val: i64) -> Result<(), String> {
-        unsafe {
-        let a = ASN1_INTEGER_new();
-        ASN1_INTEGER_set(a, val);
-        let ret = i2d_ASN1_INTEGER(a, ptr::null_mut());
-        if ret < 0 {
-            return Err(format!("Error on i2d_ASN1_INTEGER: {}", get_bssl_error()));
-        }
-        let cur = buf.len();
-        buf.resize(cur + ret as usize, 0);
-        // p is mutated by i2d_* funcs. Don't use it after the call.
-        let mut p = buf.as_mut_ptr().add(cur);
-        if i2d_ASN1_INTEGER(a, &mut p) != ret {
-            return Err(format!("Error on i2d_ASN1_INTEGER: {}", get_bssl_error()));
-        }
-        ASN1_INTEGER_free(a);
-        Ok(())
-        }
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn push_null(buf: &mut Vec<u8>) -> Result<(), String> {
-        unsafe {
-        let a = ASN1_NULL_new();
-        let ret = i2d_ASN1_NULL(a, ptr::null_mut());
-        if ret < 0 {
-            return Err(format!("Error on i2d_ASN1_NULL: {}", get_bssl_error()));
-        }
-        let cur = buf.len();
-        buf.resize(cur + ret as usize, 0);
-        // p is mutated by i2d_* funcs. Don't use it after the call.
-        let mut p = buf.as_mut_ptr().add(cur);
-        if i2d_ASN1_NULL(a, &mut p) != ret {
-            return Err(format!("Error on i2d_ASN1_NULL: {}", get_bssl_error()));
-        }
-        ASN1_NULL_free(a);
-        Ok(())
-        }
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn push_enum(buf: &mut Vec<u8>, val: i64) -> Result<(), String> {
-        unsafe {
-        let a = ASN1_ENUMERATED_new();
-        ASN1_ENUMERATED_set(a, val);
-        let ret = i2d_ASN1_ENUMERATED(a, ptr::null_mut());
-        if ret < 0 {
-            return Err(format!("Error on i2d_ASN1_ENUMERATED: {}", get_bssl_error()));
-        }
-        let cur = buf.len();
-        buf.resize(cur + ret as usize, 0);
-        // p is mutated by i2d_* funcs. Don't use it after the call.
-        let mut p = buf.as_mut_ptr().add(cur);
-        if i2d_ASN1_ENUMERATED(a, &mut p) != ret {
-            return Err(format!("Error on i2d_ASN1_ENUMERATED: {}", get_bssl_error()));
-        }
-        ASN1_ENUMERATED_free(a);
-        Ok(())
-        }
-    }
-
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn push_oc(buf: &mut Vec<u8>, val: &[u8]) -> Result<(), String> {
-        unsafe {
-        let a = ASN1_OCTET_STRING_new();
-        ASN1_OCTET_STRING_set(a, val.as_ptr(), val.len() as i32);
-        let ret = i2d_ASN1_OCTET_STRING(a, ptr::null_mut());
-        if ret < 0 {
-            return Err(format!("Error on i2d_ASN1_OCTET_STRING: {}", get_bssl_error()));
-        }
-        let cur = buf.len();
-        buf.resize(cur + ret as usize, 0);
-        // p is mutated by i2d_* funcs. Don't use it after the call.
-        let mut p = buf.as_mut_ptr().add(cur);
-        if i2d_ASN1_OCTET_STRING(a, &mut p) != ret {
-            return Err(format!("Error on i2d_ASN1_OCTET_STRING: {}", get_bssl_error()));
-        }
-        ASN1_OCTET_STRING_free(a);
-        Ok(())
-        }
-    }
 
     #[test]
     #[allow(clippy::undocumented_unsafe_blocks)]
     fn test_new_cert() {
-        let mut new_cert_buf = vec![];
-
-        unsafe {
-            let mut ccf_ptr = CERTIFICATE_1.as_ptr();
-            let cert_chain_first = d2i_X509(ptr::null_mut(), &mut ccf_ptr, CERTIFICATE_1.len() as i64);
-            println!("load cert");
-            assert!(!cert_chain_first.is_null());
-
-            let cert = X509_new();
-            assert!(!cert.is_null());
-            X509_set_version(cert, 2);
-            println!("new cert");
-
-            let sn = ASN1_INTEGER_new();
-            ASN1_INTEGER_set_int64(sn, 1);
-            X509_set_serialNumber(cert, sn);
-            ASN1_INTEGER_free(sn);
-
-            X509_gmtime_adj(X509_get_notBefore(cert), 0);
-            X509_gmtime_adj(X509_get_notAfter(cert), 20i64*365*24*3600);
-
-            let pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, ptr::null_mut());
-            if pctx.is_null() {
-                println!("Error on EVP_PKEY_CTX_new_id: {}", get_bssl_error());
+        let params = [
+            KeyParameter{tag: Tag::KEY_SIZE, value: KeyParameterValue::Integer(256)},
+            KeyParameter{tag: Tag::ALGORITHM, value: KeyParameterValue::Algorithm(Algorithm::EC)},
+            KeyParameter{tag: Tag::EC_CURVE, value: KeyParameterValue::EcCurve(EcCurve::P_256)},
+            KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN)},
+            KeyParameter{tag: Tag::DIGEST, value: KeyParameterValue::Digest(Digest::SHA_2_256)},
+            KeyParameter{tag: Tag::NO_AUTH_REQUIRED, value: KeyParameterValue::BoolValue(true)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_AFTER, value: KeyParameterValue::DateTime(2461449600000)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_BEFORE, value: KeyParameterValue::DateTime(1727331613146)},
+            KeyParameter{tag: Tag::CERTIFICATE_SERIAL, value: KeyParameterValue::Blob([1].to_vec())},
+            KeyParameter{tag: Tag::CERTIFICATE_SUBJECT, value: KeyParameterValue::Blob([
+                48, 31, 49, 29, 48, 27, 6, 3, 85, 4, 3, 19, 20, 65, 110, 100, 114, 111, 105, 100, 32, 75, 101, 121, 115, 116, 111, 114, 101, 32, 75, 101, 121
+            ].to_vec())},
+            KeyParameter{tag: Tag::ATTESTATION_CHALLENGE, value: KeyParameterValue::Blob([
+                84, 104, 117, 32, 83, 101, 112, 32, 50, 54, 32, 49, 53, 58, 50, 48, 58, 49, 51, 32, 71, 77, 84, 43, 48, 57, 58, 48, 48, 32, 50, 48, 50, 52
+            ].to_vec())},
+            KeyParameter{tag: Tag::CREATION_DATETIME, value: KeyParameterValue::DateTime(1727331613171)},
+            KeyParameter{tag: Tag::ATTESTATION_APPLICATION_ID, value: KeyParameterValue::Blob([
+                48, 77, 49, 39, 48, 37, 4, 32, 105, 111, 46, 103, 105, 116, 104, 117, 98, 46, 118, 118, 98, 50, 48, 54, 48, 46, 107, 101, 121, 97, 116, 116, 101, 115, 116, 97, 116, 105, 111, 110, 2, 1, 1, 49, 34, 4, 32, 25, 14, 182, 241, 92, 240, 119, 70, 66, 113, 124, 38, 133, 114, 25, 223, 83, 81, 191, 115, 103, 239, 33, 178, 173, 192, 84, 38, 247, 253, 196, 10
+            ].to_vec())},
+        ];
+        let (b, chara) = match gen_new_cert(&params) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("{}", e);
                 return;
             }
-            if EVP_PKEY_paramgen_init(pctx) == 0 {
-                println!("Error on EVP_PKEY_paramgen_init: {}", get_bssl_error());
-                return;
-            }
-
-            if EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) == 0 {
-                println!("Error on EVP_PKEY_CTX_set_ec_paramgen_curve_nid: {}", get_bssl_error());
-                return;
-            }
-
-            let mut params : *mut EVP_PKEY = ptr::null_mut();
-            if EVP_PKEY_paramgen(pctx, &mut params) == 0 {
-                println!("Error on EVP_PKEY_paramgen: {}", get_bssl_error());
-                return;
-            }
-
-            // key generation context
-            let ctx = EVP_PKEY_CTX_new(params, ptr::null_mut());
-            if ctx.is_null() {
-                println!("Error on EVP_PKEY_CTX_new for key gen: {}", get_bssl_error());
-                return;
-            }
-            if EVP_PKEY_keygen_init(ctx) == 0 {
-                println!("Error on EVP_PKEY_keygen_init: {}", get_bssl_error());
-                return;
-            }
-    
-            let mut key: *mut EVP_PKEY = ptr::null_mut();
-            if EVP_PKEY_keygen(ctx, &mut key) == 0 {
-                println!("Error on EVP_PKEY_keygen: {}", get_bssl_error());
-                return;
-            }
-
-            let ec_key = EVP_PKEY_get1_EC_KEY(key);
-            let bio = BIO_new(BIO_s_mem());
-            if PEM_write_bio_ECPrivateKey(bio, ec_key, ptr::null_mut(), ptr::null_mut(), 0, None, ptr::null_mut()) == 0 {
-                println!("Error on PEM_write_bio_ECPrivateKey: {}", get_bssl_error());
-                return;
-            }
-            let mut buf : *mut BUF_MEM = ptr::null_mut();
-            BIO_get_mem_ptr(bio, &mut buf);
-            let pem_str = String::from_utf8_lossy(std::slice::from_raw_parts((*buf).data, (*buf).length)).to_string();
-            BIO_free(bio);
-            println!("Generated private key: {pem_str}");
-            
-            EVP_PKEY_free(params);
-            EVP_PKEY_CTX_free(pctx);
-            EVP_PKEY_CTX_free(ctx);
-
-            if X509_set_pubkey(cert, key) == 0 {
-                println!("Error on X509_set_pubkey: {}", get_bssl_error());
-                return;
-            }
-
-            let ccf_subject = X509_get_subject_name(cert_chain_first);
-            assert!(!ccf_subject.is_null());
-
-            X509_set_issuer_name(cert, ccf_subject);
-            //X509_free(cert_chain_first);
-            let subject = X509_NAME_new();
-            assert!(!subject.is_null());
-            println!("subject new");
-            assert!(X509_NAME_add_entry_by_txt(subject, "commonName\0".as_ptr(), MBSTRING_ASC, "Android Keystore Key\0".as_ptr(), -1, -1, 0) == 1);
-            println!("subject add ent");
-            X509_set_subject_name(cert, subject);
-            println!("subject set");
-
-
-            // extensions //
-
-            let mut ex: *mut X509_EXTENSION = ptr::null_mut();
-
-            let oc = ASN1_OCTET_STRING_new();
-            // key usage keyCertSign
-            ASN1_OCTET_STRING_set(oc, "\x03\x02\x02\x04".as_ptr(), 4);
-            X509_EXTENSION_create_by_NID(&mut ex, NID_key_usage, 1, oc);
-            if X509_add_ext(cert, ex, -1) == 0 {
-                println!("Error on X509_add_ext (key usage ext.): {}", get_bssl_error());
-                return;
-            }
-            ASN1_OCTET_STRING_free(oc);
-            X509_EXTENSION_free(ex);
-            ex = ptr::null_mut();
-            let mut nid: i32 = -1;
-            if nid == -1 {
-                nid = OBJ_create("1.3.6.1.4.1.11129.2.1.17\0".as_ptr(), "MyAlias\0".as_ptr(), "My Test Alias Extension\0".as_ptr());
-                println!("nid: {}", nid);
-            }
-
-            let oc = ASN1_OCTET_STRING_new();
-            println!("oc: {:?}", oc);
-
-            //let version = ASN1_INTEGER_new();
-            //ASN1_INTEGER_set(version, 300);
-            //let ret = i2d_ASN1_INTEGER(version, ptr::null_mut());
-            //if ret < 0 {
-            //    println!("Error on i2d_ASN1_INTEGER: {}", get_bssl_error());
-            //    return;
-            //}
-            //let cur = att_ex.len();
-            //att_ex.resize(cur + ret as usize, 0);
-            //// p is mutated by i2d_* funcs. Don't use it after the call.
-            //let mut p = att_ex.as_mut_ptr().add(cur);
-            //if i2d_ASN1_INTEGER(version, &mut p) != ret {
-            //    println!("Error on i2d_ASN1_INTEGER: {}", get_bssl_error());
-            //    return;
-            //}
-            //ASN1_INTEGER_free(version);
-            let func = || -> Result<Vec<u8>, String> {
-                let mut att_ex : Vec<u8> = vec![];
-                push_int(&mut att_ex, 300)?;
-                push_enum(&mut att_ex, 2)?;
-                push_int(&mut att_ex, 300)?;
-                push_enum(&mut att_ex, 2)?;
-                push_oc(&mut att_ex, b"dummy chalenge")?;
-                // empty uniqueId
-                push_oc(&mut att_ex, b"")?;
-
-                let mut auth0 : Vec<u8> = vec![];
-                let mut wrapped_int : Vec<u8> = vec![];
-                push_int(&mut wrapped_int, 100)?;
-                wrap_tag(&mut auth0, 701, &wrapped_int)?;
-                let mut wrapped_oc : Vec<u8> = vec![];
-                push_oc(&mut wrapped_oc, b"com.sample.appid")?;
-                wrap_tag(&mut auth0, 709, &wrapped_oc)?;
-
-                wrap_sequence(&mut att_ex, &auth0)?;
-
-                let mut auth1 : Vec<u8> = vec![];
-
-                // purpose
-                let mut wrapped_int : Vec<u8> = vec![];
-                push_int(&mut wrapped_int, 2)?;
-                let mut wrapped_set : Vec<u8> = vec![];
-                wrap_set(&mut wrapped_set, &wrapped_int)?;
-                wrap_tag(&mut auth1, 1, &wrapped_set)?;
-
-                // algo
-                let mut wrapped_int : Vec<u8> = vec![];
-                push_int(&mut wrapped_int, 2)?;
-                wrap_tag(&mut auth1, 2, &wrapped_int)?;
-
-                // key size
-                let mut wrapped_int : Vec<u8> = vec![];
-                push_int(&mut wrapped_int, 256)?;
-                wrap_tag(&mut auth1, 3, &wrapped_int)?;
-
-                // digest
-                let mut wrapped_int : Vec<u8> = vec![];
-                push_int(&mut wrapped_int, 4)?;
-                let mut wrapped_set : Vec<u8> = vec![];
-                wrap_set(&mut wrapped_set, &wrapped_int)?;
-                wrap_tag(&mut auth1, 5, &wrapped_set)?;
-
-                // ecCurve
-                let mut wrapped_int : Vec<u8> = vec![];
-                push_int(&mut wrapped_int, 1)?;
-                wrap_tag(&mut auth1, 10, &wrapped_in)?;
-
-                // noAuthRequired
-                let mut wrapped_null : Vec<u8> = vec![];
-                push_null(&mut wrapped_null)?;
-                wrap_tag(&mut auth1, 503, &wrapped_null)?;
-
-                // origin                      [702] EXPLICIT INTEGER OPTIONAL,
-                let mut wrapped_int : Vec<u8> = vec![];
-                push_int(&mut wrapped_int, 0)?;
-                wrap_tag(&mut auth1, 702, &wrapped_int)?;
-
-                wrap_sequence(&mut att_ex, &auth1)?;
-
-                let mut att_ex_seq_buf = vec![];
-
-                wrap_sequence(&mut att_ex_seq_buf, &att_ex)?;
-                Ok(att_ex_seq_buf)
-            };
-            let att_ex_seq_buf = match func() {
-                Ok(s) => s,
-                Err(s) => {
-                    println!("{}", s);
-                    return;
-                }
-            };
-
-
-            println!("new oc: {} {:?}", att_ex_seq_buf.len(), att_ex_seq_buf);
-            if ASN1_OCTET_STRING_set(oc, att_ex_seq_buf.as_ptr(), att_ex_seq_buf.len() as i32) == 0 {
-                println!("Error on ASN1_OCTET_STRING_set: {}", get_bssl_error());
-                return;
-            }
-            X509_EXTENSION_create_by_NID(&mut ex, nid, 0, oc);
-            if ex.is_null() {
-                println!("Error on X509_EXTENSION_create_by_NID: {}", get_bssl_error());
-                return;
-            }
-            if X509_add_ext(cert, ex, -1) == 0 {
-                println!("Error on X509_add_ext (attest ext.): {}", get_bssl_error());
-                return;
-            }
-            ASN1_OCTET_STRING_free(oc);
-            X509_EXTENSION_free(ex);
-
-            // load private key //
-
-            let mut key_ptr = EC_PRIVATE_KEY.as_ptr();
-            let ec_key2 = d2i_ECPrivateKey(ptr::null_mut(), &mut key_ptr, EC_PRIVATE_KEY.len() as i64);
-            if ec_key2.is_null() {
-                println!("Error on d2i_ECPrivateKey: {}", get_bssl_error());
-                return;
-            }
-
-            let key2 = EVP_PKEY_new();
-            if key2.is_null() {
-                println!("Error on EVP_PKEY_new: {}", get_bssl_error());
-                return;
-            }
-
-            if EVP_PKEY_set1_EC_KEY(key2, ec_key2) == 0 {
-                println!("Error on EVP_PKEY_set1_EC_KEY: {}", get_bssl_error());
-                return;
-            }
-
-            // sign //
-
-            if X509_sign(cert, key2, EVP_sha256()) == 0 {
-                println!("failed on X509_sign");
-                X509_free(cert);
-                return;
-            }
-
-            EVP_PKEY_free(key2);
-
-            // dump //
-
-            let mut der_len = i2d_X509(cert, ptr::null_mut());
-            if der_len < 1 {
-                let e = ERR_get_error();
-                let mut errbuf = Vec::with_capacity(1000);
-                ERR_error_string(e, errbuf.as_mut_ptr());
-                errbuf.set_len(130);
-                let s = String::from_utf8(errbuf).expect("Our bytes should be valid utf8");
-                println!("error der_len: {der_len}  err: {} {}", ERR_get_error(), s);
-                X509_free(cert);
-                return;
-            }
-
-            new_cert_buf.clear();
-            new_cert_buf.reserve(der_len as usize);
-            der_len = i2d_X509(cert, &mut new_cert_buf.as_mut_ptr());
-            new_cert_buf.set_len(der_len as usize);
-
-            let mut hex_buf = String::new();
-            for (i, b) in new_cert_buf.iter().enumerate() {
-                hex_buf += format!("{:02x}", b).as_str();
-
-                if i % 32 == 31 {
-                    hex_buf += "\n";
-                }
-            }
-            log::info!("keystore2hook new cert: \n{hex_buf}");
-            println!("hex_buf_len: {}", hex_buf.len());
-            println!("hex_buf: \n{hex_buf}");
-
-            EVP_PKEY_free(key);
-            X509_NAME_free(subject);
-            X509_free(cert);
         };
+        println!("chara: {:?}", chara);
+
+        let mut hex_buf = String::new();
+        for (i, b) in b.iter().enumerate() {
+            hex_buf += format!("{:02x}", b).as_str();
+
+            if i % 32 == 31 {
+                hex_buf += "\n";
+            }
+        }
+        println!("hex_buf_len: {}", hex_buf.len());
+        println!("hex_buf: \n{hex_buf}");
+
+        if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b) {
+            println!("{:?}", e);
+        }
     }
 }
