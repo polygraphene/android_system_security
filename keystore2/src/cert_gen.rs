@@ -421,7 +421,7 @@ impl Deref for EvpPkey {
     }
 }
 
-/// Genearate certificate from [KeyParameter]
+/// Genearate key and certificate from [KeyParameter]
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub fn gen_new_cert(params: &[KeyParameter]) -> Result<(
     Vec<u8> /* Generated leaf cert */,
@@ -498,6 +498,7 @@ pub fn gen_new_cert(params: &[KeyParameter]) -> Result<(
         }
         let key = EvpPkey::wrap(key)?;
 
+        drop(params2);
         drop(pctx);
         drop(ctx);
 
@@ -794,7 +795,8 @@ pub fn gen_new_cert(params: &[KeyParameter]) -> Result<(
         let hex_buf = hex_dump(&new_cert_buf);
         log::info!("keystore2hook new cert: \n{hex_buf}");
 
-        // dump private key //
+        // Generate key blob //
+        // Magic + header + private key
 
         let mut blob = vec![];
         blob.extend(CERT_GEN_BLOB_MAGIC.iter());
@@ -813,7 +815,6 @@ pub fn gen_new_cert(params: &[KeyParameter]) -> Result<(
             return Err(get_bssl_error("i2d_PrivateKey"));
         }
 
-        log::info!("Returning from gen cert");
         Ok((new_cert_buf, vec![software_chara, tee_chara], blob))
     }
 }
