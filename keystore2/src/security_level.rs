@@ -513,7 +513,6 @@ impl KeystoreSecurityLevel {
         Ok(result)
     }
 
-    #[allow(clippy::undocumented_unsafe_blocks)]
     fn generate_key_hook(
         &self,
         caller_uid: u32,
@@ -528,7 +527,7 @@ impl KeystoreSecurityLevel {
         let result = self.keymint.generateKey(params, attestation_key);
         let is_attestation = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
         if is_attestation && result.is_err() && attestation_key.is_none() {
-            let (new_cert_buf, key_chara) = match gen_new_cert(params) {
+            let (new_cert_buf, key_chara, blob) = match gen_new_cert(params) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("keystore2hook Error on gen_new_cert: {}", e);
@@ -537,7 +536,7 @@ impl KeystoreSecurityLevel {
             };
 
             let new_result = KeyCreationResult {
-                keyBlob: vec![1,2,3],
+                keyBlob: blob,
                 keyCharacteristics: key_chara,
                 certificateChain: vec![
                     Certificate { encodedCertificate: new_cert_buf },
@@ -1105,8 +1104,10 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
 
 #[cfg(any(test, rust_analyzer))]
 //#[cfg(test)]
-#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
+
+    use std::io;
+    use std::io::Read;
 
     use super::*;
     use crate::error::map_km_error;
@@ -1190,10 +1191,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_new_cert() {
+        test_new_cert_inner(1);
+        println!("Done. Press return to exit.");
+        let mut s = String::new();
+        let _ = io::stdin().read_to_string(&mut s);
+    }
 
     #[test]
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    fn test_new_cert() {
+    fn test_many_cert() {
+        test_new_cert_inner(1_000);
+        println!("Done. Press return to exit.");
+        let mut s = String::new();
+        let _ = io::stdin().read_to_string(&mut s);
+    }
+
+    #[test]
+    fn test_more_many_cert() {
+        test_new_cert_inner(2_000);
+        println!("Done. Press return to exit.");
+        let mut s = String::new();
+        let _ = io::stdin().read_to_string(&mut s);
+    }
+
+    fn test_new_cert_inner(n: i64) {
         let params = [
             KeyParameter{tag: Tag::KEY_SIZE, value: KeyParameterValue::Integer(256)},
             KeyParameter{tag: Tag::ALGORITHM, value: KeyParameterValue::Algorithm(Algorithm::EC)},
@@ -1215,28 +1237,42 @@ mod tests {
                 48, 77, 49, 39, 48, 37, 4, 32, 105, 111, 46, 103, 105, 116, 104, 117, 98, 46, 118, 118, 98, 50, 48, 54, 48, 46, 107, 101, 121, 97, 116, 116, 101, 115, 116, 97, 116, 105, 111, 110, 2, 1, 1, 49, 34, 4, 32, 25, 14, 182, 241, 92, 240, 119, 70, 66, 113, 124, 38, 133, 114, 25, 223, 83, 81, 191, 115, 103, 239, 33, 178, 173, 192, 84, 38, 247, 253, 196, 10
             ].to_vec())},
         ];
-        let (b, chara) = match gen_new_cert(&params) {
-            Ok(b) => b,
-            Err(e) => {
-                println!("{}", e);
-                return;
+        for i in 0..n {
+            let (b, chara, blob) = match gen_new_cert(&params) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("{}", e);
+                    return;
+                }
+            };
+            if i == n - 1 {
+                println!("chara: {:?}", chara);
+
+                let mut hex_buf = String::new();
+                for (i, b) in b.iter().enumerate() {
+                    hex_buf += format!("{:02x}", b).as_str();
+
+                    if i % 32 == 31 {
+                        hex_buf += "\n";
+                    }
+                }
+                println!("hex_buf_len: {}", hex_buf.len());
+                println!("hex_buf: \n{hex_buf}");
+
+                let mut hex_buf = String::new();
+                for (i, b) in blob.iter().enumerate() {
+                    hex_buf += format!("{:02x}", b).as_str();
+
+                    if i % 32 == 31 {
+                        hex_buf += "\n";
+                    }
+                }
+                println!("blob len: {}", hex_buf.len());
+                println!("blob: \n{hex_buf}");
+                if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b) {
+                    println!("{:?}", e);
+                }
             }
-        };
-        println!("chara: {:?}", chara);
-
-        let mut hex_buf = String::new();
-        for (i, b) in b.iter().enumerate() {
-            hex_buf += format!("{:02x}", b).as_str();
-
-            if i % 32 == 31 {
-                hex_buf += "\n";
-            }
-        }
-        println!("hex_buf_len: {}", hex_buf.len());
-        println!("hex_buf: \n{hex_buf}");
-
-        if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b) {
-            println!("{:?}", e);
         }
     }
 }
