@@ -442,6 +442,28 @@ struct CertGenKeyBlob {
     cert_chain: Vec<Vec<u8>>,
 }
 
+fn verify_key_parameters(
+    params: &[KeyParameter], 
+) -> Result<(), String> {
+    let mut has_attest_purpose = false;
+    let mut has_other_purposes = false;
+    for p in params.iter() {
+        match p {
+            KeyParameter { tag: Tag::PURPOSE, value : KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)} => {
+                has_attest_purpose = true;
+            },
+            KeyParameter { tag: Tag::PURPOSE, value : KeyParameterValue::KeyPurpose(_)} => {
+                has_other_purposes = true;
+            },
+            _ => {}
+        }
+    }
+    if has_attest_purpose && has_other_purposes {
+        return Err("Incompatible purpose found.".to_owned());
+    }
+    Ok(())
+}
+
 /// Genearate key and certificate from [KeyParameter]
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub fn gen_new_cert(
@@ -455,6 +477,8 @@ pub fn gen_new_cert(
     ),
     String> {
     unsafe {
+        verify_key_parameters(params)?;
+
         let cert_gen_key_blob = match attestation_key {
             Some(AttestationKey{ keyBlob, attestKeyParams : _, issuerSubjectName : _}) if keyBlob.starts_with(CERT_GEN_BLOB_MAGIC) =>
                 serde_cbor::from_slice(&keyBlob[CERT_GEN_BLOB_MAGIC.len()..]).map_err(|x| format!("Invalid blob. Deserialize error: {:?}", x))?,

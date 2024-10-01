@@ -1365,4 +1365,55 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_incompatible_purpose() {
+        let mut params = [
+            KeyParameter{tag: Tag::KEY_SIZE, value: KeyParameterValue::Integer(256)},
+            KeyParameter{tag: Tag::ALGORITHM, value: KeyParameterValue::Algorithm(Algorithm::EC)},
+            KeyParameter{tag: Tag::EC_CURVE, value: KeyParameterValue::EcCurve(EcCurve::P_256)},
+            KeyParameter{tag: Tag::DIGEST, value: KeyParameterValue::Digest(Digest::SHA_2_256)},
+            KeyParameter{tag: Tag::NO_AUTH_REQUIRED, value: KeyParameterValue::BoolValue(true)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_AFTER, value: KeyParameterValue::DateTime(2461449600000)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_BEFORE, value: KeyParameterValue::DateTime(1727331613146)},
+            KeyParameter{tag: Tag::CERTIFICATE_SERIAL, value: KeyParameterValue::Blob([1].to_vec())},
+            KeyParameter{tag: Tag::CERTIFICATE_SUBJECT, value: KeyParameterValue::Blob([
+                48, 31, 49, 29, 48, 27, 6, 3, 85, 4, 3, 19, 20, 65, 110, 100, 114, 111, 105, 100, 32, 75, 101, 121, 115, 116, 111, 114, 101, 32, 75, 101, 121
+            ].to_vec())},
+            KeyParameter{tag: Tag::ATTESTATION_CHALLENGE, value: KeyParameterValue::Blob([
+                84, 104, 117, 32, 83, 101, 112, 32, 50, 54, 32, 49, 53, 58, 50, 48, 58, 49, 51, 32, 71, 77, 84, 43, 48, 57, 58, 48, 48, 32, 50, 48, 50, 52
+            ].to_vec())},
+            KeyParameter{tag: Tag::CREATION_DATETIME, value: KeyParameterValue::DateTime(1727331613171)},
+            KeyParameter{tag: Tag::ATTESTATION_APPLICATION_ID, value: KeyParameterValue::Blob([
+                48, 77, 49, 39, 48, 37, 4, 32, 105, 111, 46, 103, 105, 116, 104, 117, 98, 46, 118, 118, 98, 50, 48, 54, 48, 46, 107, 101, 121, 97, 116, 116, 101, 115, 116, 97, 116, 105, 111, 110, 2, 1, 1, 49, 34, 4, 32, 25, 14, 182, 241, 92, 240, 119, 70, 66, 113, 124, 38, 133, 114, 25, 223, 83, 81, 191, 115, 103, 239, 33, 178, 173, 192, 84, 38, 247, 253, 196, 10
+            ].to_vec())},
+            ].to_vec();
+
+        params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN)});
+        let result = gen_new_cert(&params, None);
+        assert!(result.is_ok());
+
+        params.remove(params.len() - 1);
+        params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)});
+        let result = gen_new_cert(&params, None);
+        assert!(result.is_ok());
+
+        params.remove(params.len() - 1);
+        params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)});
+        params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN)});
+        let result = gen_new_cert(&params, None);
+        assert!(result.is_err());
+        let e = result.unwrap_err();
+        assert!(e.contains("Incompatible purpose"));
+
+        params.remove(params.len() - 1);
+        params.remove(params.len() - 1);
+        params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN)});
+        params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)});
+        let result = gen_new_cert(&params, None);
+        assert!(result.is_err());
+        let e = result.unwrap_err();
+        assert!(e.contains("Incompatible purpose"));
+    }
+
 }
