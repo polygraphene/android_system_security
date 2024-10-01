@@ -24,6 +24,8 @@ use bssl_sys::*;
 #[allow(unused_imports)]
 use std::ptr;
 use std::sync::OnceLock;
+use serde::{Deserialize, Serialize};
+use serde_cbor;
 
 static NID : OnceLock<i32> = OnceLock::new();
 
@@ -222,10 +224,6 @@ fn hex_dump(buf: &[u8]) -> String {
     hex_buf
 }
 
-fn key_len_to_vec(len: i64) -> Vec<u8> {
-    len.to_le_bytes().to_vec()
-}
-
 struct X509Rs(*mut X509);
 
 #[allow(clippy::undocumented_unsafe_blocks)]
@@ -405,6 +403,22 @@ impl EvpPkey {
     fn wrap(p: *mut EVP_PKEY) -> Result<EvpPkey, String> {
         Ok(EvpPkey(p))
     }
+
+    fn i2d(&self) -> Result<Vec<u8>, String> {
+        let priv_len = unsafe { i2d_PrivateKey(self.0, ptr::null_mut()) as i64 };
+        if priv_len < 1 {
+            return Err(get_bssl_error("i2d_PrivateKey"));
+        }
+
+        let mut b = vec![0u8; priv_len as usize];
+
+        let mut ptr = b.as_mut_ptr();
+        if unsafe { i2d_PrivateKey(self.0, &mut ptr) } as i64 != priv_len {
+            return Err(get_bssl_error("i2d_PrivateKey"));
+        }
+
+        Ok(b)
+    }
 }
 
 #[allow(clippy::undocumented_unsafe_blocks)]
@@ -421,15 +435,36 @@ impl Deref for EvpPkey {
     }
 }
 
+// Inefficient serialize. serde is not good at serializing [u8] or Vec<u8>.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CertGenKeyBlob {
+    private_key: Vec<u8>,
+    cert_chain: Vec<Vec<u8>>,
+}
+
 /// Genearate key and certificate from [KeyParameter]
 #[allow(clippy::undocumented_unsafe_blocks)]
-pub fn gen_new_cert(params: &[KeyParameter]) -> Result<(
+pub fn gen_new_cert(
+    params: &[KeyParameter], 
+    attestation_key: Option<&AttestationKey>,
+) -> Result<(
     Vec<u8> /* Generated leaf cert */,
     Vec<KeyCharacteristics> /* key characteristics */,
-    Vec<u8> /* keyBlob */),
+    Vec<u8> /* keyBlob */,
+    Vec<Vec<u8>> /* cert_chain */,
+    ),
     String> {
     unsafe {
-        let cert_chain_first = X509Rs::d2i(CERTIFICATE_1)?;
+        let cert_gen_key_blob = match attestation_key {
+            Some(AttestationKey{ keyBlob, attestKeyParams : _, issuerSubjectName : _}) if keyBlob.starts_with(CERT_GEN_BLOB_MAGIC) =>
+                serde_cbor::from_slice(&keyBlob[CERT_GEN_BLOB_MAGIC.len()..]).map_err(|x| format!("Invalid blob. Deserialize error: {:?}", x))?,
+            None => CertGenKeyBlob { private_key: EC_PRIVATE_KEY.to_vec(), cert_chain : vec![CERTIFICATE_1.to_vec(), CERTIFICATE_2.to_vec(), CERTIFICATE_3.to_vec()] },
+            _ => return Err("Invalid blob".to_owned())
+        };
+        let Some(cert_chain_first) = cert_gen_key_blob.cert_chain.first() else {
+            return Err("Invalid blob".to_owned())
+        };
+        let cert_chain_first = X509Rs::d2i(cert_chain_first)?;
 
         let cert = X509Rs::new()?;
         X509_set_version(*cert, 2);
@@ -760,27 +795,27 @@ pub fn gen_new_cert(params: &[KeyParameter]) -> Result<(
 
         // load private key //
 
-        let mut key_ptr = EC_PRIVATE_KEY.as_ptr();
-        let ec_key2 = d2i_ECPrivateKey(ptr::null_mut(), &mut key_ptr, EC_PRIVATE_KEY.len() as i64);
+        let mut key_ptr = cert_gen_key_blob.private_key.as_ptr();
+        let ec_key2 = d2i_ECPrivateKey(ptr::null_mut(), (&mut key_ptr) as *mut *const u8, cert_gen_key_blob.private_key.len() as i64);
         if ec_key2.is_null() {
             return Err(get_bssl_error("d2i_ECPrivateKey"));
         }
 
-        let key2 = EvpPkey::new()?;
+        let signer_key = EvpPkey::new()?;
 
         // This function assign ec key to internal pointer. ec key will be automatically freed when
-        // freeing key2.
-        if EVP_PKEY_assign_EC_KEY(*key2, ec_key2) == 0 {
+        // freeing signer_key.
+        if EVP_PKEY_assign_EC_KEY(*signer_key, ec_key2) == 0 {
             return Err(get_bssl_error("EVP_PKEY_set1_EC_KEY"));
         }
 
         // sign //
 
-        if X509_sign(*cert, *key2, EVP_sha256()) == 0 {
+        if X509_sign(*cert, *signer_key, EVP_sha256()) == 0 {
             return Err(get_bssl_error("X509_sign"));
         }
 
-        drop(key2);
+        drop(signer_key);
 
         // dump //
 
@@ -798,23 +833,14 @@ pub fn gen_new_cert(params: &[KeyParameter]) -> Result<(
         // Generate key blob //
         // Magic + header + private key
 
-        let mut blob = vec![];
-        blob.extend(CERT_GEN_BLOB_MAGIC.iter());
+        let mut blob = CERT_GEN_BLOB_MAGIC.to_vec();
 
-        let priv_len = i2d_PrivateKey(*key, ptr::null_mut()) as i64;
-        if priv_len < 1 {
-            return Err(get_bssl_error("i2d_PrivateKey"));
-        }
+        let mut chain = vec![new_cert_buf.clone()];
+        chain.extend(cert_gen_key_blob.cert_chain.clone());
+        let blob_obj = CertGenKeyBlob { private_key: key.i2d()?, cert_chain: chain };
+        let cbor_blob = serde_cbor::to_vec(&blob_obj).map_err(|x| format!("Error on serialize key blob: {:?}", x))?;
+        blob.extend(&cbor_blob);
 
-        blob.extend(key_len_to_vec(priv_len));
-        let cur = blob.len();
-        blob.resize(cur + priv_len as usize, 0);
-
-        let mut curptr = blob.as_mut_ptr().add(cur);
-        if i2d_PrivateKey(*key, &mut curptr) as i64 != priv_len {
-            return Err(get_bssl_error("i2d_PrivateKey"));
-        }
-
-        Ok((new_cert_buf, vec![software_chara, tee_chara], blob))
+        Ok((new_cert_buf, vec![software_chara, tee_chara], blob, cert_gen_key_blob.cert_chain.iter().map(|x| x.to_vec()).collect()))
     }
 }

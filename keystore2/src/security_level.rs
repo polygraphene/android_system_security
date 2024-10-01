@@ -525,9 +525,9 @@ impl KeystoreSecurityLevel {
             log::info!("keystore2hook generate_key_hook: params[{}] = {:?} tag1={} tag2={} value={:?}", p, pa.tag, (pa.tag.0 >> 28), pa.tag.0 & ((1 << 28)-1), pa.value);
         }
         let result = self.keymint.generateKey(params, attestation_key);
-        let is_attestation = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
-        if is_attestation && result.is_err() && attestation_key.is_none() {
-            let (new_cert_buf, key_chara, blob) = match gen_new_cert(params) {
+        let has_attestation_challenge = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
+        if has_attestation_challenge && result.is_err() {
+            let (new_cert_buf, key_chara, blob, cert_chain) = match gen_new_cert(params, attestation_key) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("keystore2hook Error on gen_new_cert: {}", e);
@@ -535,15 +535,20 @@ impl KeystoreSecurityLevel {
                 }
             };
 
+            let mut new_chain = vec![
+                Certificate { encodedCertificate: new_cert_buf },
+            ];
+            new_chain.extend(
+                cert_chain.iter().map(|x| {
+                    Certificate { encodedCertificate: x.to_vec() }
+                })
+            );
+
+
             let new_result = KeyCreationResult {
                 keyBlob: blob,
                 keyCharacteristics: key_chara,
-                certificateChain: vec![
-                    Certificate { encodedCertificate: new_cert_buf },
-                    Certificate { encodedCertificate: CERTIFICATE_1.to_vec() },
-                    Certificate { encodedCertificate: CERTIFICATE_2.to_vec() },
-                    Certificate { encodedCertificate: CERTIFICATE_3.to_vec() },
-                ]
+                certificateChain: new_chain
             };
             return Ok(new_result);
         }
@@ -1105,10 +1110,6 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
 #[cfg(any(test, rust_analyzer))]
 //#[cfg(test)]
 mod tests {
-
-    use std::io;
-    use std::io::Read;
-
     use super::*;
     use crate::error::map_km_error;
     use crate::globals::get_keymint_device;
@@ -1194,25 +1195,16 @@ mod tests {
     #[test]
     fn test_new_cert() {
         test_new_cert_inner(1);
-        println!("Done. Press return to exit.");
-        let mut s = String::new();
-        let _ = io::stdin().read_to_string(&mut s);
     }
 
     #[test]
     fn test_many_cert() {
         test_new_cert_inner(1_000);
-        println!("Done. Press return to exit.");
-        let mut s = String::new();
-        let _ = io::stdin().read_to_string(&mut s);
     }
 
     #[test]
     fn test_more_many_cert() {
         test_new_cert_inner(2_000);
-        println!("Done. Press return to exit.");
-        let mut s = String::new();
-        let _ = io::stdin().read_to_string(&mut s);
     }
 
     fn test_new_cert_inner(n: i64) {
@@ -1238,11 +1230,11 @@ mod tests {
             ].to_vec())},
         ];
         for i in 0..n {
-            let (b, chara, blob) = match gen_new_cert(&params) {
+            let (b, chara, blob, _chain) = match gen_new_cert(&params, None) {
                 Ok(b) => b,
                 Err(e) => {
                     println!("{}", e);
-                    return;
+                    panic!();
                 }
             };
             if i == n - 1 {
@@ -1270,6 +1262,104 @@ mod tests {
                 println!("blob len: {}", hex_buf.len());
                 println!("blob: \n{hex_buf}");
                 if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b) {
+                    println!("{:?}", e);
+                }
+            }
+        }
+    }
+
+    fn hex_dump(buf: &[u8]) -> String {
+        let mut hex_buf = String::new();
+        for (i, b) in buf.iter().enumerate() {
+            hex_buf += format!("{:02x}", b).as_str();
+
+            if i % 32 == 31 {
+                hex_buf += "\n";
+            }
+        }
+        hex_buf
+    }
+
+    #[test]
+    fn test_app_generated_key_gen_cert() {
+        test_app_generated_key_gen_cert_inner(1)
+    }
+
+    fn test_app_generated_key_gen_cert_inner(n: i64) {
+        let params_app_gen = [
+            KeyParameter{tag: Tag::KEY_SIZE, value: KeyParameterValue::Integer(256)},
+            KeyParameter{tag: Tag::ALGORITHM, value: KeyParameterValue::Algorithm(Algorithm::EC)},
+            KeyParameter{tag: Tag::EC_CURVE, value: KeyParameterValue::EcCurve(EcCurve::P_256)},
+            KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)},
+            KeyParameter{tag: Tag::DIGEST, value: KeyParameterValue::Digest(Digest::SHA_2_256)},
+            KeyParameter{tag: Tag::NO_AUTH_REQUIRED, value: KeyParameterValue::BoolValue(true)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_AFTER, value: KeyParameterValue::DateTime(2461449600000)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_BEFORE, value: KeyParameterValue::DateTime(1727331613146)},
+            KeyParameter{tag: Tag::CERTIFICATE_SERIAL, value: KeyParameterValue::Blob([1].to_vec())},
+            KeyParameter{tag: Tag::CERTIFICATE_SUBJECT, value: KeyParameterValue::Blob([
+                //   41:d=2  hl=2 l=  28 cons: SEQUENCE
+                //   43:d=3  hl=2 l=  26 cons: SET
+                //   45:d=4  hl=2 l=  24 cons: SEQUENCE
+                //   47:d=5  hl=2 l=   3 prim: OBJECT            :commonName
+                //   52:d=5  hl=2 l=  17 prim: UTF8STRING        :app generated key
+                0x30, 0x1c, 0x31, 0x1a, 0x30, 0x18, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c,
+                0x11, 0x61, 0x70, 0x70, 0x20, 0x67, 0x65, 0x6e, 0x65, 0x72, 0x61, 0x74,
+                0x65, 0x64, 0x20, 0x6b, 0x65, 0x79
+            ].to_vec())},
+            KeyParameter{tag: Tag::ATTESTATION_CHALLENGE, value: KeyParameterValue::Blob(b"This is a challenge value.".to_vec())},
+            KeyParameter{tag: Tag::CREATION_DATETIME, value: KeyParameterValue::DateTime(1727331613171)},
+            KeyParameter{tag: Tag::ATTESTATION_APPLICATION_ID, value: KeyParameterValue::Blob([
+                48, 77, 49, 39, 48, 37, 4, 32, 105, 111, 46, 103, 105, 116, 104, 117, 98, 46, 118, 118, 98, 50, 48, 54, 48, 46, 107, 101, 121, 97, 116, 116, 101, 115, 116, 97, 116, 105, 111, 110, 2, 1, 1, 49, 34, 4, 32, 25, 14, 182, 241, 92, 240, 119, 70, 66, 113, 124, 38, 133, 114, 25, 223, 83, 81, 191, 115, 103, 239, 33, 178, 173, 192, 84, 38, 247, 253, 196, 10
+            ].to_vec())},
+            ];
+        let params = [
+            KeyParameter{tag: Tag::KEY_SIZE, value: KeyParameterValue::Integer(256)},
+            KeyParameter{tag: Tag::ALGORITHM, value: KeyParameterValue::Algorithm(Algorithm::EC)},
+            KeyParameter{tag: Tag::EC_CURVE, value: KeyParameterValue::EcCurve(EcCurve::P_256)},
+            KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN)},
+            KeyParameter{tag: Tag::DIGEST, value: KeyParameterValue::Digest(Digest::SHA_2_256)},
+            KeyParameter{tag: Tag::NO_AUTH_REQUIRED, value: KeyParameterValue::BoolValue(true)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_AFTER, value: KeyParameterValue::DateTime(2461449600000)},
+            KeyParameter{tag: Tag::CERTIFICATE_NOT_BEFORE, value: KeyParameterValue::DateTime(1727331613146)},
+            KeyParameter{tag: Tag::CERTIFICATE_SERIAL, value: KeyParameterValue::Blob([1].to_vec())},
+            KeyParameter{tag: Tag::CERTIFICATE_SUBJECT, value: KeyParameterValue::Blob([
+                48, 31, 49, 29, 48, 27, 6, 3, 85, 4, 3, 19, 20, 65, 110, 100, 114, 111, 105, 100, 32, 75, 101, 121, 115, 116, 111, 114, 101, 32, 75, 101, 121
+            ].to_vec())},
+            KeyParameter{tag: Tag::ATTESTATION_CHALLENGE, value: KeyParameterValue::Blob([
+                84, 104, 117, 32, 83, 101, 112, 32, 50, 54, 32, 49, 53, 58, 50, 48, 58, 49, 51, 32, 71, 77, 84, 43, 48, 57, 58, 48, 48, 32, 50, 48, 50, 52
+            ].to_vec())},
+            KeyParameter{tag: Tag::CREATION_DATETIME, value: KeyParameterValue::DateTime(1727331613171)},
+            KeyParameter{tag: Tag::ATTESTATION_APPLICATION_ID, value: KeyParameterValue::Blob([
+                48, 77, 49, 39, 48, 37, 4, 32, 105, 111, 46, 103, 105, 116, 104, 117, 98, 46, 118, 118, 98, 50, 48, 54, 48, 46, 107, 101, 121, 97, 116, 116, 101, 115, 116, 97, 116, 105, 111, 110, 2, 1, 1, 49, 34, 4, 32, 25, 14, 182, 241, 92, 240, 119, 70, 66, 113, 124, 38, 133, 114, 25, 223, 83, 81, 191, 115, 103, 239, 33, 178, 173, 192, 84, 38, 247, 253, 196, 10
+            ].to_vec())},
+        ];
+        for i in 0..n {
+            let (b, _chara, blob, _chain) = match gen_new_cert(&params_app_gen, None) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("{}", e);
+                    panic!();
+                }
+            };
+            let (b2, chara, blob, chain) = match gen_new_cert(&params, Some(&AttestationKey{keyBlob: blob, attestKeyParams: params_app_gen.to_vec(), issuerSubjectName: vec![]})) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("{}", e);
+                    panic!();
+                }
+            };
+            if i == n - 1 {
+                println!("chara: {:?}", chara);
+
+                println!("app gen cert: \n{}", hex_dump(&b));
+                println!("attested cert: \n{}", hex_dump(&b2));
+
+                for (i, c) in chain.iter().enumerate() {
+                    println!("Cert {}:\n{}", i, hex_dump(c));
+                }
+
+                println!("blob: \n{}", hex_dump(&blob));
+                if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b2) {
                     println!("{:?}", e);
                 }
             }
