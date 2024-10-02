@@ -53,8 +53,7 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
     KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
     KeyMintHardwareInfo::KeyMintHardwareInfo, KeyParameter::KeyParameter,
-    KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
-    Certificate::Certificate
+    KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag
 };
 use android_hardware_security_keymint::binder::{BinderFeatures, Strong, ThreadState};
 use android_system_keystore2::aidl::android::system::keystore2::{
@@ -515,43 +514,30 @@ impl KeystoreSecurityLevel {
 
     fn generate_key_hook(
         &self,
-        caller_uid: u32,
+        _caller_uid: u32,
         params: &[KeyParameter],
         attestation_key: Option<&AttestationKey>,
     ) -> binder::Result<KeyCreationResult> {
-        log::info!("keystore2hook enter generate_key_hook caller_uid={caller_uid}");
-        log::info!("keystore2hook generate_key_hook: has attest key: {}", attestation_key.is_some());
-        for (p, pa) in params.iter().enumerate() {
-            log::info!("keystore2hook generate_key_hook: params[{}] = {:?} tag1={} tag2={} value={:?}", p, pa.tag, (pa.tag.0 >> 28), pa.tag.0 & ((1 << 28)-1), pa.value);
-        }
         let result = self.keymint.generateKey(params, attestation_key);
         let has_attestation_challenge = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
+
         if has_attestation_challenge && result.is_err() {
-            let (key_chara, blob, cert_chain) = match gen_new_cert(params, attestation_key) {
-                Ok(s) => s,
+            match gen_new_cert(params, attestation_key) {
+                Ok(s) => Ok(s),
                 Err(cert_gen::GenNewCertErr::KeyMintErr(e)) => {
-                    return Err(e)
+                    // Emulate keymint error like INCOMPATIBLE_PURPOSE.
+                    Err(e)
                 },
                 Err(cert_gen::GenNewCertErr::Generic(e)) => {
                     log::error!("keystore2hook Error on gen_new_cert: {}", e);
-                    return result;
+                    // Error to fallback keymint result
+                    result
                 }
-            };
-
-            let new_chain = cert_chain.iter().map(|x| {
-                Certificate { encodedCertificate: x.to_vec() }
-            }).collect();
-
-            let new_result = KeyCreationResult {
-                keyBlob: blob,
-                keyCharacteristics: key_chara,
-                certificateChain: new_chain
-            };
-            return Ok(new_result);
+            }
+        } else {
+            // Successful attestation or non-attestation. Pass original result from keymint.
+            result
         }
-            
-        log::info!("keystore2hook generate_key_hook: generateKey result: {:?}", result);
-        result
     }
 
     fn generate_key(
@@ -1227,7 +1213,7 @@ mod tests {
             ].to_vec())},
         ];
         for i in 0..n {
-            let (chara, _blob, mut chain) = match gen_new_cert(&params, None) {
+            let KeyCreationResult { keyCharacteristics: chara, keyBlob: _blob, certificateChain: mut chain } = match gen_new_cert(&params, None) {
                 Ok(b) => b,
                 Err(e) => {
                     println!("{:?}", e);
@@ -1240,7 +1226,7 @@ mod tests {
                 println!("chara: {:?}", chara);
 
                 let mut hex_buf = String::new();
-                for (i, b) in b.iter().enumerate() {
+                for (i, b) in b.encodedCertificate.iter().enumerate() {
                     hex_buf += format!("{:02x}", b).as_str();
 
                     if i % 32 == 31 {
@@ -1251,9 +1237,9 @@ mod tests {
                 println!("hex_buf: \n{hex_buf}");
 
                 //println!("blob: \n{hex_buf}");
-                if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b) {
-                    println!("{:?}", e);
-                }
+                //if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b.encodedCertificate) {
+                //    println!("{:?}", e);
+                //}
             }
         }
     }
@@ -1324,7 +1310,7 @@ mod tests {
             ].to_vec())},
         ];
         for i in 0..n {
-            let (_chara, blob, mut chain) = match gen_new_cert(&params_app_gen, None) {
+            let KeyCreationResult { keyCharacteristics: _chara, keyBlob: blob, certificateChain: mut chain } = match gen_new_cert(&params_app_gen, None) {
                 Ok(b) => b,
                 Err(e) => {
                     println!("{:?}", e);
@@ -1335,7 +1321,7 @@ mod tests {
                 println!("Got {} certs for app key", chain.len());
             }
             let b = chain.remove(0);
-            let (chara, _blob, mut chain) = match gen_new_cert(&params, Some(&AttestationKey{keyBlob: blob, attestKeyParams: params_app_gen.to_vec(), issuerSubjectName: vec![]})) {
+            let KeyCreationResult { keyCharacteristics: chara, keyBlob: _blob, certificateChain: mut chain } = match gen_new_cert(&params, Some(&AttestationKey{keyBlob: blob, attestKeyParams: params_app_gen.to_vec(), issuerSubjectName: vec![]})) {
                 Ok(b) => b,
                 Err(e) => {
                     println!("{:?}", e);
@@ -1347,16 +1333,11 @@ mod tests {
                 let b2 = chain.remove(0);
                 println!("chara: {:?}", chara);
 
-                println!("app gen cert: \n{}", hex_dump(&b));
-                println!("attested cert: \n{}", hex_dump(&b2));
+                println!("app gen cert: \n{}", hex_dump(&b.encodedCertificate));
+                println!("attested cert: \n{}", hex_dump(&b2.encodedCertificate));
 
                 for (i, c) in chain.iter().enumerate() {
-                    println!("Cert {}:\n{}", i, hex_dump(c));
-                }
-
-                //println!("blob: \n{}", hex_dump(&blob));
-                if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b2) {
-                    println!("{:?}", e);
+                    println!("Cert {}:\n{}", i, hex_dump(&c.encodedCertificate));
                 }
             }
         }

@@ -499,12 +499,7 @@ fn generic_bssl_err<T>(v: &str) -> Result<T, GenNewCertErr> {
 pub fn gen_new_cert(
     params: &[KeyParameter], 
     attestation_key: Option<&AttestationKey>,
-) -> Result<(
-    Vec<KeyCharacteristics> /* key characteristics */,
-    Vec<u8> /* keyBlob */,
-    Vec<Vec<u8>> /* cert_chain */,
-    ),
-    GenNewCertErr> {
+) -> Result<KeyCreationResult, GenNewCertErr> {
     unsafe {
         verify_key_parameters(params)?;
 
@@ -652,7 +647,7 @@ pub fn gen_new_cert(
         // empty uniqueId
         push_oc(&mut att_ex, b"")?;
 
-        let mut software_chara = KeyCharacteristics { 
+        let mut sw_characteristics = KeyCharacteristics { 
             securityLevel: SecurityLevel::SOFTWARE,
             authorizations: vec![]
         };
@@ -663,7 +658,7 @@ pub fn gen_new_cert(
             Some(KeyParameter{tag: _, value: KeyParameterValue::DateTime(b)}) => b,
             _ => return generic_err("Tag::ATTESTATION_CHALLENGE is not found"),
         };
-        software_chara.authorizations.push(params.iter().find(|kp| kp.tag == Tag::CREATION_DATETIME).unwrap().clone());
+        sw_characteristics.authorizations.push(params.iter().find(|kp| kp.tag == Tag::CREATION_DATETIME).unwrap().clone());
 
         let mut auth0 : Vec<u8> = vec![];
         let mut wrapped_int : Vec<u8> = vec![];
@@ -675,7 +670,7 @@ pub fn gen_new_cert(
             Some(KeyParameter{tag: _, value: KeyParameterValue::Blob(b)}) => b,
             _ => return generic_err("Tag::ATTESTATION_APPLICATION_ID is not found"),
         };
-        software_chara.authorizations.push(params.iter().find(|kp| kp.tag == Tag::ATTESTATION_APPLICATION_ID).unwrap().clone());
+        sw_characteristics.authorizations.push(params.iter().find(|kp| kp.tag == Tag::ATTESTATION_APPLICATION_ID).unwrap().clone());
         let mut wrapped_oc : Vec<u8> = vec![];
         push_oc(&mut wrapped_oc, b)?;
         wrap_tag(&mut auth0, 709, &wrapped_oc)?;
@@ -685,7 +680,7 @@ pub fn gen_new_cert(
         // teeEnforced                AuthorizationList,
 
         let mut auth1 : Vec<u8> = vec![];
-        let mut tee_chara = KeyCharacteristics { 
+        let mut tee_characteristics = KeyCharacteristics { 
             securityLevel: SecurityLevel::TRUSTED_ENVIRONMENT,
             authorizations: vec![]
         };
@@ -728,7 +723,7 @@ pub fn gen_new_cert(
                 _ => continue,
             }
             // Recognized tags
-            tee_chara.authorizations.push(p.clone());
+            tee_characteristics.authorizations.push(p.clone());
         }
         // purpose
         let mut wrapped_set : Vec<u8> = vec![];
@@ -895,6 +890,9 @@ pub fn gen_new_cert(
         let cbor_blob = serde_cbor::to_vec(&blob_obj).map_err(|x| format!("Error on serialize key blob: {:?}", x))?;
         blob.extend(&cbor_blob);
 
-        Ok((vec![software_chara, tee_chara], blob, blob_obj.cert_chain))
+        let certificate_chain = blob_obj.cert_chain.into_iter().map(|x| {
+            Certificate { encodedCertificate: x }
+        }).collect();
+        Ok(KeyCreationResult { keyBlob: blob, keyCharacteristics: vec![sw_characteristics, tee_characteristics], certificateChain: certificate_chain })
     }
 }
