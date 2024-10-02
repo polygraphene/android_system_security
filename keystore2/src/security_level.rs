@@ -28,7 +28,7 @@ use crate::globals::{
 };
 use crate::key_parameter::KeyParameter as KsKeyParam;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
-use crate::ks_err;
+use crate::{cert_gen, ks_err};
 use crate::metrics_store::log_key_creation_event_stats;
 use crate::remote_provisioning::RemProvState;
 use crate::super_key::{KeyBlob, SuperKeyManager};
@@ -136,7 +136,7 @@ impl KeystoreSecurityLevel {
             certificateChain: mut certificate_chain,
         } = creation_result;
 
-        let mut cert_info: CertificateInfo = CertificateInfo::new(
+        let mut cert_info: CertificateInfo = CertificateInfo::new_hooked(
             match certificate_chain.len() {
                 0 => None,
                 _ => Some(certificate_chain.remove(0).encodedCertificate),
@@ -527,23 +527,20 @@ impl KeystoreSecurityLevel {
         let result = self.keymint.generateKey(params, attestation_key);
         let has_attestation_challenge = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
         if has_attestation_challenge && result.is_err() {
-            let (new_cert_buf, key_chara, blob, cert_chain) = match gen_new_cert(params, attestation_key) {
+            let (key_chara, blob, cert_chain) = match gen_new_cert(params, attestation_key) {
                 Ok(s) => s,
-                Err(e) => {
+                Err(cert_gen::GenNewCertErr::KeyMintErr(e)) => {
+                    return Err(e)
+                },
+                Err(cert_gen::GenNewCertErr::Generic(e)) => {
                     log::error!("keystore2hook Error on gen_new_cert: {}", e);
                     return result;
                 }
             };
 
-            let mut new_chain = vec![
-                Certificate { encodedCertificate: new_cert_buf },
-            ];
-            new_chain.extend(
-                cert_chain.iter().map(|x| {
-                    Certificate { encodedCertificate: x.to_vec() }
-                })
-            );
-
+            let new_chain = cert_chain.iter().map(|x| {
+                Certificate { encodedCertificate: x.to_vec() }
+            }).collect();
 
             let new_result = KeyCreationResult {
                 keyBlob: blob,
@@ -1230,14 +1227,16 @@ mod tests {
             ].to_vec())},
         ];
         for i in 0..n {
-            let (b, chara, blob, _chain) = match gen_new_cert(&params, None) {
+            let (chara, _blob, mut chain) = match gen_new_cert(&params, None) {
                 Ok(b) => b,
                 Err(e) => {
-                    println!("{}", e);
+                    println!("{:?}", e);
                     panic!();
                 }
             };
             if i == n - 1 {
+                println!("Got {} certs", chain.len());
+                let b = chain.remove(0);
                 println!("chara: {:?}", chara);
 
                 let mut hex_buf = String::new();
@@ -1251,16 +1250,7 @@ mod tests {
                 println!("hex_buf_len: {}", hex_buf.len());
                 println!("hex_buf: \n{hex_buf}");
 
-                let mut hex_buf = String::new();
-                for (i, b) in blob.iter().enumerate() {
-                    hex_buf += format!("{:02x}", b).as_str();
-
-                    if i % 32 == 31 {
-                        hex_buf += "\n";
-                    }
-                }
-                println!("blob len: {}", hex_buf.len());
-                println!("blob: \n{hex_buf}");
+                //println!("blob: \n{hex_buf}");
                 if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b) {
                     println!("{:?}", e);
                 }
@@ -1334,21 +1324,27 @@ mod tests {
             ].to_vec())},
         ];
         for i in 0..n {
-            let (b, _chara, blob, _chain) = match gen_new_cert(&params_app_gen, None) {
+            let (_chara, blob, mut chain) = match gen_new_cert(&params_app_gen, None) {
                 Ok(b) => b,
                 Err(e) => {
-                    println!("{}", e);
-                    panic!();
-                }
-            };
-            let (b2, chara, blob, chain) = match gen_new_cert(&params, Some(&AttestationKey{keyBlob: blob, attestKeyParams: params_app_gen.to_vec(), issuerSubjectName: vec![]})) {
-                Ok(b) => b,
-                Err(e) => {
-                    println!("{}", e);
+                    println!("{:?}", e);
                     panic!();
                 }
             };
             if i == n - 1 {
+                println!("Got {} certs for app key", chain.len());
+            }
+            let b = chain.remove(0);
+            let (chara, _blob, mut chain) = match gen_new_cert(&params, Some(&AttestationKey{keyBlob: blob, attestKeyParams: params_app_gen.to_vec(), issuerSubjectName: vec![]})) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("{:?}", e);
+                    panic!();
+                }
+            };
+            if i == n - 1 {
+                println!("Got {} certs", chain.len());
+                let b2 = chain.remove(0);
                 println!("chara: {:?}", chara);
 
                 println!("app gen cert: \n{}", hex_dump(&b));
@@ -1358,7 +1354,7 @@ mod tests {
                     println!("Cert {}:\n{}", i, hex_dump(c));
                 }
 
-                println!("blob: \n{}", hex_dump(&blob));
+                //println!("blob: \n{}", hex_dump(&blob));
                 if let Err(e) = std::fs::write("/data/local/tmp/gen.der", b2) {
                     println!("{:?}", e);
                 }
@@ -1403,8 +1399,13 @@ mod tests {
         params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::SIGN)});
         let result = gen_new_cert(&params, None);
         assert!(result.is_err());
-        let e = result.unwrap_err();
-        assert!(e.contains("Incompatible purpose"));
+        match result.unwrap_err() {
+            cert_gen::GenNewCertErr::Generic(_) => panic!(),
+            cert_gen::GenNewCertErr::KeyMintErr(e) => {
+                assert_eq!(e.exception_code(), android_system_keystore2::binder::ExceptionCode::SERVICE_SPECIFIC);
+                assert_eq!(e.service_specific_error(), android_hardware_security_keymint::aidl::android::hardware::security::keymint::ErrorCode::ErrorCode::INCOMPATIBLE_PURPOSE.0);
+            }
+        }
 
         params.remove(params.len() - 1);
         params.remove(params.len() - 1);
@@ -1412,8 +1413,13 @@ mod tests {
         params.push(KeyParameter{tag: Tag::PURPOSE, value: KeyParameterValue::KeyPurpose(KeyPurpose::ATTEST_KEY)});
         let result = gen_new_cert(&params, None);
         assert!(result.is_err());
-        let e = result.unwrap_err();
-        assert!(e.contains("Incompatible purpose"));
+        match result.unwrap_err() {
+            cert_gen::GenNewCertErr::Generic(_) => panic!(),
+            cert_gen::GenNewCertErr::KeyMintErr(e) => {
+                assert_eq!(e.exception_code(), android_system_keystore2::binder::ExceptionCode::SERVICE_SPECIFIC);
+                assert_eq!(e.service_specific_error(), android_hardware_security_keymint::aidl::android::hardware::security::keymint::ErrorCode::ErrorCode::INCOMPATIBLE_PURPOSE.0);
+            }
+        }
     }
 
 }
