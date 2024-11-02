@@ -794,7 +794,7 @@ pub fn gen_new_cert(
 
         // osPatchLevel
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, 202409)?;
+        push_int(&mut wrapped_int, 202410)?;
         wrap_tag(&mut auth1, 706, &wrapped_int)?;
 
         for tag in Tag::ATTESTATION_ID_BRAND.0..=Tag::ATTESTATION_ID_MODEL.0 {
@@ -807,11 +807,11 @@ pub fn gen_new_cert(
             }
         }
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, 202409)?;
+        push_int(&mut wrapped_int, 202410)?;
         wrap_tag(&mut auth1, 718, &wrapped_int)?;
 
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, 202409)?;
+        push_int(&mut wrapped_int, 202410)?;
         wrap_tag(&mut auth1, 719, &wrapped_int)?;
 
         // End of teeEnforced                AuthorizationList,
