@@ -62,6 +62,8 @@ rust_defaults {
         "librustutils",
         "libserde",
         "libserde_cbor",
+        "libserde_json",
+        "libserde_xml_rs",
         "libthiserror",
         "libtokio",
         "libwatchdog_rs",

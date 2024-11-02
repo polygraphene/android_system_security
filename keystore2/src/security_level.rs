@@ -19,7 +19,7 @@ use crate::audit_log::{
     log_key_deleted, log_key_generated, log_key_imported, log_key_integrity_violation,
 };
 #[allow(unused_imports)]
-use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard, EC_PRIVATE_KEY, CERTIFICATE_1, CERTIFICATE_2, CERTIFICATE_3};
+use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard};
 use crate::error::{
     self, into_logged_binder, map_km_error, wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
 };
@@ -69,6 +69,7 @@ use std::convert::TryInto;
 use std::time::SystemTime;
 
 use crate::cert_gen::gen_new_cert;
+use crate::keybox::LoadedKeybox;
 
 /// Implementation of the IKeystoreSecurityLevel Interface.
 pub struct KeystoreSecurityLevel {
@@ -522,15 +523,25 @@ impl KeystoreSecurityLevel {
         let has_attestation_challenge = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
 
         if has_attestation_challenge && result.is_err() {
-            match gen_new_cert(params, attestation_key) {
-                Ok(s) => Ok(s),
-                Err(cert_gen::GenNewCertErr::KeyMintErr(e)) => {
-                    // Emulate keymint error like INCOMPATIBLE_PURPOSE.
-                    Err(e)
-                },
-                Err(cert_gen::GenNewCertErr::Generic(e)) => {
-                    log::error!("keystore2hook Error on gen_new_cert: {}", e);
-                    // Error to fallback keymint result
+            let kb_load_result = LoadedKeybox::load_keybox_from_disk();
+
+            match kb_load_result {
+                Ok(kb) => {
+                    match gen_new_cert(params, attestation_key, kb) {
+                        Ok(s) => Ok(s),
+                        Err(cert_gen::GenNewCertErr::KeyMintErr(e)) => {
+                            // Emulate keymint error like INCOMPATIBLE_PURPOSE.
+                            Err(e)
+                        },
+                        Err(cert_gen::GenNewCertErr::Generic(e)) => {
+                            log::error!("keystore2hook Error on gen_new_cert: {}", e);
+                            // Error to fallback keymint result
+                            result
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::info!("keybox cannot be read: {}. Don't generate cert.", e);
                     result
                 }
             }

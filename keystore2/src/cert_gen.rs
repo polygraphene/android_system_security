@@ -1,7 +1,8 @@
 //! Generate certificate for attestation on behalf of (broken) TEE keymint.
 //! 
 #[allow(unused_imports)]
-use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard, EC_PRIVATE_KEY, CERTIFICATE_1, CERTIFICATE_2, CERTIFICATE_3};
+use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard};
+use crate::keybox::LoadedKeybox;
 #[allow(unused_imports)]
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, AttestationKey::AttestationKey,
@@ -243,11 +244,11 @@ impl X509Rs {
         Ok(X509Rs(p))
     }
 
-    fn d2i(buf: &[u8]) -> Result<X509Rs, GenNewCertErr> {
-        let mut pbuf = buf.as_ptr();
-        let p = unsafe { d2i_X509(ptr::null_mut(), &mut pbuf, buf.len() as i64) };
+    fn read_pem(buf: &[u8]) -> Result<X509Rs, GenNewCertErr> {
+        let bio = Bio::new(buf)?;
+        let p = unsafe { PEM_read_bio_X509(*bio, ptr::null_mut(), None, ptr::null_mut()) };
         if p.is_null() {
-            return Err(get_bssl_error_cert_gen("d2i_X509"));
+            return Err(get_bssl_error_cert_gen("PEM_read_bio_X509"));
         }
         Ok(X509Rs(p))
     }
@@ -442,6 +443,33 @@ impl Deref for EvpPkey {
     }
 }
 
+struct Bio(*mut BIO);
+
+#[allow(clippy::undocumented_unsafe_blocks)]
+impl Bio {
+    fn new(buffer: &[u8]) -> Result<Bio, GenNewCertErr> {
+        let p = unsafe { BIO_new_mem_buf(buffer.as_ptr() as *const libc::c_void, buffer.len() as isize) };
+        if p.is_null() {
+            return Err(get_bssl_error_cert_gen("BIO_new_mem_buf"));
+        }
+        Ok(Bio(p))
+    }
+}
+
+#[allow(clippy::undocumented_unsafe_blocks)]
+impl Drop for Bio {
+    fn drop(&mut self) {
+        unsafe { BIO_free(self.0); }
+    }
+}
+
+impl Deref for Bio {
+    type Target = *mut BIO;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 // Inefficient serialize. serde is not good at serializing [u8] or Vec<u8>.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct CertGenKeyBlob {
@@ -469,6 +497,42 @@ fn verify_key_parameters(
         return Err(GenNewCertErr::KeyMintErr(Status::new_service_specific_error(ErrorCode::INCOMPATIBLE_PURPOSE.0, None)));
     }
     Ok(())
+}
+
+// Read private key from PEM format buffer.
+// Support RSA and EC key. Return key as EVP_PKEY.
+#[allow(clippy::undocumented_unsafe_blocks)]
+fn read_private_key(buffer: Vec<u8>) -> Result<EvpPkey, GenNewCertErr> {
+    // First, try to read EC key. If it fails, then try RSA.
+    let bio = Bio::new(&buffer);
+    if let Ok(bio) = bio {
+        let key = EvpPkey::new()?;
+        let ec_key = unsafe { PEM_read_bio_ECPrivateKey(*bio, ptr::null_mut(), None, ptr::null_mut()) };
+        if !ec_key.is_null() {
+            // This function assign EC key to internal pointer. EC key will be automatically freed when
+            // freeing EVP_PKEY.
+            if unsafe { EVP_PKEY_assign_EC_KEY(*key, ec_key) } != 0 {
+                return Ok(key);
+            }
+        }
+        unsafe { EC_KEY_free(ec_key) };
+    }
+
+    // Try to read RSA key. If it fail, pass error to caller because all attempts were failed.
+    let bio = Bio::new(&buffer)?;
+    let rsa_key = unsafe { PEM_read_bio_RSAPrivateKey(*bio, ptr::null_mut(), None, ptr::null_mut()) };
+    if rsa_key.is_null() {
+        return generic_bssl_err("PEM_read_bio_ECPrivateKey and PEM_read_bio_RSAPrivateKey");
+    }
+    let key = EvpPkey::new()?;
+
+    // This function assign RSA key to internal pointer. RSA key will be automatically freed when
+    // freeing EVP_PKEY.
+    if unsafe { EVP_PKEY_assign_RSA(*key, rsa_key) } == 0 {
+        unsafe { RSA_free(rsa_key) };
+        return generic_bssl_err("PEM_read_bio_ECPrivateKey and PEM_read_bio_RSAPrivateKey");
+    }
+    Ok(key)
 }
 
 /// Error for gen_new_cert
@@ -499,6 +563,7 @@ fn generic_bssl_err<T>(v: &str) -> Result<T, GenNewCertErr> {
 pub fn gen_new_cert(
     params: &[KeyParameter], 
     attestation_key: Option<&AttestationKey>,
+    kb: LoadedKeybox
 ) -> Result<KeyCreationResult, GenNewCertErr> {
     unsafe {
         verify_key_parameters(params)?;
@@ -506,13 +571,13 @@ pub fn gen_new_cert(
         let cert_gen_key_blob = match attestation_key {
             Some(AttestationKey{ keyBlob, attestKeyParams : _, issuerSubjectName : _}) if keyBlob.starts_with(CERT_GEN_BLOB_MAGIC) =>
                 serde_cbor::from_slice(&keyBlob[CERT_GEN_BLOB_MAGIC.len()..]).map_err(|x| format!("Invalid blob. Deserialize error: {:?}", x))?,
-            None => CertGenKeyBlob { private_key: EC_PRIVATE_KEY.to_vec(), cert_chain : vec![CERTIFICATE_1.to_vec(), CERTIFICATE_2.to_vec(), CERTIFICATE_3.to_vec()] },
+            None => CertGenKeyBlob { private_key: kb.get_private_key(), cert_chain : kb.get_chain() },
             _ => return generic_err("Invalid blob")
         };
         let Some(cert_chain_first) = cert_gen_key_blob.cert_chain.first() else {
             return generic_err("Invalid blob")
         };
-        let cert_chain_first = X509Rs::d2i(cert_chain_first)?;
+        let cert_chain_first = X509Rs::read_pem(cert_chain_first)?;
 
         let cert = X509Rs::new()?;
         X509_set_version(*cert, 2);
@@ -789,12 +854,12 @@ pub fn gen_new_cert(
 
         // osVersion: 15.0.0 -> 150000
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, 150000)?;
+        push_int(&mut wrapped_int, kb.get_os_version() as i64)?;
         wrap_tag(&mut auth1, 705, &wrapped_int)?;
 
-        // osPatchLevel
+        // osPatchLevel: 202410
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, 202410)?;
+        push_int(&mut wrapped_int, kb.get_os_patch_level() as i64)?;
         wrap_tag(&mut auth1, 706, &wrapped_int)?;
 
         for tag in Tag::ATTESTATION_ID_BRAND.0..=Tag::ATTESTATION_ID_MODEL.0 {
@@ -807,11 +872,11 @@ pub fn gen_new_cert(
             }
         }
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, 202410)?;
+        push_int(&mut wrapped_int, kb.get_vendor_patch_level() as i64)?;
         wrap_tag(&mut auth1, 718, &wrapped_int)?;
 
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, 202410)?;
+        push_int(&mut wrapped_int, kb.get_boot_patch_level() as i64)?;
         wrap_tag(&mut auth1, 719, &wrapped_int)?;
 
         // End of teeEnforced                AuthorizationList,
@@ -839,21 +904,9 @@ pub fn gen_new_cert(
         drop(oc);
         drop(ex);
 
-        // load private key //
+        // read private key //
 
-        let mut key_ptr = cert_gen_key_blob.private_key.as_ptr();
-        let ec_key2 = d2i_ECPrivateKey(ptr::null_mut(), (&mut key_ptr) as *mut *const u8, cert_gen_key_blob.private_key.len() as i64);
-        if ec_key2.is_null() {
-            return generic_bssl_err("d2i_ECPrivateKey");
-        }
-
-        let signer_key = EvpPkey::new()?;
-
-        // This function assign ec key to internal pointer. ec key will be automatically freed when
-        // freeing signer_key.
-        if EVP_PKEY_assign_EC_KEY(*signer_key, ec_key2) == 0 {
-            return generic_bssl_err("EVP_PKEY_set1_EC_KEY");
-        }
+        let signer_key = read_private_key(cert_gen_key_blob.private_key)?;
 
         // sign //
 
