@@ -98,11 +98,11 @@ impl LoadedKeybox {
         let config = match LoadedKeybox::read_config(&config_path) {
             Ok(s) => s,
             Err(e) => {
-                info!("Could not read config keybox-config.json: {e}. Use default value.");
+                info!("keystore2hook Could not read config keybox-config.json: {e}. Use default value.");
                 KeyboxConfig::default()
             }
         };
-        info!("Use config: {:?}", config);
+        info!("keystore2hook Use config: {:?}", config);
         if config.key_index as usize >= keys.len() {
             return Err(anyhow!("Specified index was invalid"));
         }

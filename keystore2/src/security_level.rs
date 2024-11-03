@@ -484,7 +484,6 @@ impl KeystoreSecurityLevel {
         // If the caller requests any device identifier attestation tag, check that they hold the
         // correct Android permission.
         if params.iter().any(|kp| is_device_id_attestation_tag(kp.tag)) {
-            log::info!("checking check_device_attestation_permissions");
             check_device_attestation_permissions().context(ks_err!(
                 "Caller does not have the permission to attest device identifiers."
             ))?;
@@ -521,6 +520,7 @@ impl KeystoreSecurityLevel {
     ) -> binder::Result<KeyCreationResult> {
         let result = self.keymint.generateKey(params, attestation_key);
         let has_attestation_challenge = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
+        log::info!("keystore2hook generate_key_hook: has_attestation_challenge: {} is_err: {}", has_attestation_challenge, result.is_err());
 
         if has_attestation_challenge && result.is_err() {
             let kb_load_result = LoadedKeybox::load_keybox_from_disk();
@@ -541,7 +541,7 @@ impl KeystoreSecurityLevel {
                     }
                 }
                 Err(e) => {
-                    log::info!("keybox cannot be read: {}. Don't generate cert.", e);
+                    log::error!("keystore2hook keybox cannot be read: {}. Don't generate cert.", e);
                     result
                 }
             }
