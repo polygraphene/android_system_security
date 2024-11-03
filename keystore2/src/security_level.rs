@@ -69,7 +69,7 @@ use std::convert::TryInto;
 use std::time::SystemTime;
 
 use crate::cert_gen::gen_new_cert;
-use crate::keybox::LoadedKeybox;
+use crate::keybox::{LoadedKeybox, Mode};
 
 /// Implementation of the IKeystoreSecurityLevel Interface.
 pub struct KeystoreSecurityLevel {
@@ -518,16 +518,19 @@ impl KeystoreSecurityLevel {
         params: &[KeyParameter],
         attestation_key: Option<&AttestationKey>,
     ) -> binder::Result<KeyCreationResult> {
-        let result = self.keymint.generateKey(params, attestation_key);
         let has_attestation_challenge = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
-        log::info!("keystore2hook generate_key_hook: has_attestation_challenge: {} is_err: {}", has_attestation_challenge, result.is_err());
+        log::info!("keystore2hook generate_key_hook: has_attestation_challenge: {}", has_attestation_challenge);
 
-        if has_attestation_challenge && result.is_err() {
-            let kb_load_result = LoadedKeybox::load_keybox_from_disk();
-
-            match kb_load_result {
-                Ok(kb) => {
-                    match gen_new_cert(params, attestation_key, kb) {
+        if !has_attestation_challenge {
+            return self.keymint.generateKey(params, attestation_key);
+        }
+        let kb = LoadedKeybox::load_keybox_from_disk();
+        let result = self.keymint.generateKey(params, attestation_key);
+        log::info!("keystore2hook generate_key_hook: mode: {:?}, is_err: {}", kb.get_mode(), result.is_err());
+        match (kb.get_mode(), result.is_err()) {
+            (Mode::Broken, true) => {
+                if let Some(key) = kb.get_key() {
+                    match gen_new_cert(params, attestation_key, key, kb.get_config()) {
                         Ok(s) => Ok(s),
                         Err(cert_gen::GenNewCertErr::KeyMintErr(e)) => {
                             // Emulate keymint error like INCOMPATIBLE_PURPOSE.
@@ -535,19 +538,16 @@ impl KeystoreSecurityLevel {
                         },
                         Err(cert_gen::GenNewCertErr::Generic(e)) => {
                             log::error!("keystore2hook Error on gen_new_cert: {}", e);
-                            // Error to fallback keymint result
+                            // We can't create bind::Result from generic error. Fallback keymint result
                             result
                         }
                     }
-                }
-                Err(e) => {
-                    log::error!("keystore2hook keybox cannot be read: {}. Don't generate cert.", e);
+                } else {
+                    log::error!("keystore2hook keybox is not specified properly. Don't generate cert.");
                     result
                 }
             }
-        } else {
-            // Successful attestation or non-attestation. Pass original result from keymint.
-            result
+            (Mode::Disable, _) | (Mode::Broken, false) => result
         }
     }
 

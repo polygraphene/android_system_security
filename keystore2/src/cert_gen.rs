@@ -2,7 +2,7 @@
 //! 
 #[allow(unused_imports)]
 use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard};
-use crate::keybox::LoadedKeybox;
+use crate::keybox::{Key, KeyboxConfig};
 #[allow(unused_imports)]
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, AttestationKey::AttestationKey,
@@ -563,7 +563,8 @@ fn generic_bssl_err<T>(v: &str) -> Result<T, GenNewCertErr> {
 pub fn gen_new_cert(
     params: &[KeyParameter], 
     attestation_key: Option<&AttestationKey>,
-    kb: LoadedKeybox
+    kb: &Key,
+    config: &KeyboxConfig
 ) -> Result<KeyCreationResult, GenNewCertErr> {
     unsafe {
         verify_key_parameters(params)?;
@@ -854,12 +855,12 @@ pub fn gen_new_cert(
 
         // osVersion: 15.0.0 -> 150000
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, kb.get_os_version() as i64)?;
+        push_int(&mut wrapped_int, config.os_version as i64)?;
         wrap_tag(&mut auth1, 705, &wrapped_int)?;
 
         // osPatchLevel: 202410
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, kb.get_os_patch_level() as i64)?;
+        push_int(&mut wrapped_int, config.os_patch_level as i64)?;
         wrap_tag(&mut auth1, 706, &wrapped_int)?;
 
         for tag in Tag::ATTESTATION_ID_BRAND.0..=Tag::ATTESTATION_ID_MODEL.0 {
@@ -872,11 +873,11 @@ pub fn gen_new_cert(
             }
         }
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, kb.get_vendor_patch_level() as i64)?;
+        push_int(&mut wrapped_int, config.vendor_patch_level as i64)?;
         wrap_tag(&mut auth1, 718, &wrapped_int)?;
 
         let mut wrapped_int : Vec<u8> = vec![];
-        push_int(&mut wrapped_int, kb.get_boot_patch_level() as i64)?;
+        push_int(&mut wrapped_int, config.boot_patch_level as i64)?;
         wrap_tag(&mut auth1, 719, &wrapped_int)?;
 
         // End of teeEnforced                AuthorizationList,
