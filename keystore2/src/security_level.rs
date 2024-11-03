@@ -136,7 +136,7 @@ impl KeystoreSecurityLevel {
             certificateChain: mut certificate_chain,
         } = creation_result;
 
-        let mut cert_info: CertificateInfo = CertificateInfo::new_hooked(
+        let mut cert_info: CertificateInfo = CertificateInfo::new(
             match certificate_chain.len() {
                 0 => None,
                 _ => Some(certificate_chain.remove(0).encodedCertificate),
