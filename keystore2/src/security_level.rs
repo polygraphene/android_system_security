@@ -64,6 +64,7 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters, ResponseCode::ResponseCode,
 };
 use anyhow::{anyhow, Context, Result};
+use binder::Status;
 use rkpd_client::store_rkpd_attestation_key;
 use std::convert::TryInto;
 use std::time::SystemTime;
@@ -551,6 +552,10 @@ impl KeystoreSecurityLevel {
                     result
                 }
             }
+            (Mode::NotProvisioned, _) => {
+                log::info!("keystore2hook Return Not provisioned error code.");
+                Err(Status::new_service_specific_error(ErrorCode::ATTESTATION_KEYS_NOT_PROVISIONED.0, None))
+            },
             (Mode::Disable, _) | (Mode::Broken, false) => result
         }
     }

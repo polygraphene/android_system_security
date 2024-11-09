@@ -67,7 +67,8 @@ struct Certificate {
 #[allow(missing_docs)]
 pub enum Mode {
     Broken,
-    Disable
+    NotProvisioned,
+    Disable,
 }
 
 // Why serde default only accept functions?
