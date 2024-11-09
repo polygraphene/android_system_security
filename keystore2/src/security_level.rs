@@ -519,7 +519,11 @@ impl KeystoreSecurityLevel {
         attestation_key: Option<&AttestationKey>,
     ) -> binder::Result<KeyCreationResult> {
         let has_attestation_challenge = params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
-        log::info!("keystore2hook generate_key_hook: has_attestation_challenge: {}", has_attestation_challenge);
+        log::info!("keystore2hook generate_key_hook: caller_uid: {} has_attestation_challenge: {}", _caller_uid, has_attestation_challenge);
+        for (idx, key_param) in params.iter().enumerate() {
+            log::info!("keystore2hook generate_key_hook: params[{}] = {:?} tag1={} tag2={} value={:?}", idx,
+                key_param.tag, (key_param.tag.0 >> 28), key_param.tag.0 & ((1 << 28)-1), key_param.value);
+        }
 
         if !has_attestation_challenge {
             return self.keymint.generateKey(params, attestation_key);
